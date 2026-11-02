@@ -43,6 +43,10 @@ type EventsClient struct {
 	// control recebe cada mensagem bruta antes do dispatch normal; retorna
 	// true se a mensagem foi consumida.
 	control func(raw []byte) bool
+	// shouldReconnect recebe o erro que encerrou a leitura (um
+	// *websocket.CloseError quando o servidor fechou com close code); retornar
+	// false encerra o loop de conexão sem reconectar.
+	shouldReconnect func(err error) bool
 
 	connMu         sync.Mutex
 	conn           *websocket.Conn
@@ -193,7 +197,7 @@ func (e *EventsClient) connectLoop() {
 			e.onOpen(conn)
 		}
 
-		e.readLoop(conn)
+		readErr := e.readLoop(conn)
 
 		e.connMu.Lock()
 		wasDestroyed := e.destroyed
@@ -204,15 +208,18 @@ func (e *EventsClient) connectLoop() {
 			return
 		}
 		e.emitDisconnected()
+		if e.shouldReconnect != nil && !e.shouldReconnect(readErr) {
+			return
+		}
 		e.waitReconnectDelay()
 	}
 }
 
-func (e *EventsClient) readLoop(conn *websocket.Conn) {
+func (e *EventsClient) readLoop(conn *websocket.Conn) error {
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			return
+			return err
 		}
 		e.dispatch(data)
 	}

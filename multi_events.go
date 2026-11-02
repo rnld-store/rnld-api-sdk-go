@@ -2,6 +2,7 @@ package rnld
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -12,6 +13,16 @@ import (
 const maxKeysPerMessage = 100
 
 const defaultMultiWSURL = defaultWSURL + "/multi"
+
+// Close codes enviados pelo rnld-bots-websocket em /ws/multi (mesmos valores
+// do servidor e do SDK TypeScript).
+const (
+	// CloseNoSubscriptions: a conexão ficou sem nenhuma guild assinada (nunca
+	// assinou, só mandou keys inválidas ou removeu todas).
+	CloseNoSubscriptions = 4001
+	// CloseTooManyInvalidKeys: excesso de api_keys inválidas na mesma conexão.
+	CloseTooManyInvalidKeys = 4002
+)
 
 // controlReply é a resposta de controle do servidor (tem `op` em vez de
 // `channel`).
@@ -29,7 +40,10 @@ type controlRequest struct {
 
 // SubscribeError descreve uma assinatura recusada pelo servidor.
 type SubscribeError struct {
-	// Reason é o motivo da recusa (ex.: "invalid_key", "limit_exceeded").
+	// Reason é o motivo da recusa: "invalid_key", "limit_exceeded",
+	// "unavailable" (banco do servidor indisponível; tente de novo) ou
+	// "too_many_invalid_keys" (o servidor fechou a conexão por excesso de keys
+	// inválidas; o cliente reconecta com backoff).
 	Reason string
 	// APIKeyHint são os primeiros caracteres da api_key recusada, quando
 	// informados pelo servidor.
@@ -48,6 +62,11 @@ type SubscribeError struct {
 // assinadas são reenviadas automaticamente.
 //
 // Eventos extras: OnSubscribed, OnUnsubscribed e OnSubscribeError.
+//
+// O servidor fecha conexões sem nenhuma guild assinada. Se isso acontecer com
+// o cliente sem keys, a reconexão fica suspensa até o próximo Subscribe.
+// Remova (Unsubscribe) keys que voltarem invalid_key: elas são reenviadas a
+// cada reconexão.
 type MultiEventsClient struct {
 	*EventsClient
 
@@ -57,6 +76,9 @@ type MultiEventsClient struct {
 	// active é a conexão que já recebeu o subscribe inicial; Subscribe e
 	// Unsubscribe só enviam direto por ela.
 	active *websocket.Conn
+	// paused: o servidor fechou por falta de assinatura e não havia keys; o
+	// loop de conexão terminou e o próximo Subscribe o reinicia.
+	paused bool
 
 	handlersMu       sync.RWMutex
 	onSubscribed     []func(guildID string)
@@ -77,6 +99,7 @@ func NewMultiEventsClient(wsURL string) *MultiEventsClient {
 	}
 	m.EventsClient.onOpen = m.handleOpen
 	m.EventsClient.control = m.handleControl
+	m.EventsClient.shouldReconnect = m.handleClose
 	m.EventsClient.OnDisconnected(m.clearActive)
 	return m
 }
@@ -91,6 +114,11 @@ func (m *MultiEventsClient) Subscribe(apiKeys ...string) *MultiEventsClient {
 			m.keySet[k] = struct{}{}
 			m.keys = append(m.keys, k)
 		}
+	}
+	if m.paused && len(m.keys) > 0 {
+		m.paused = false
+		go m.EventsClient.connectLoop() // o handleOpen envia todas as keys
+		return m
 	}
 	m.send(m.active, "subscribe", apiKeys)
 	return m
@@ -118,6 +146,9 @@ func (m *MultiEventsClient) Unsubscribe(apiKeys ...string) *MultiEventsClient {
 
 // Connect inicia a conexão WebSocket em background.
 func (m *MultiEventsClient) Connect() *MultiEventsClient {
+	m.keysMu.Lock()
+	m.paused = false
+	m.keysMu.Unlock()
 	m.EventsClient.Connect()
 	return m
 }
@@ -160,6 +191,35 @@ func (m *MultiEventsClient) clearActive() {
 	m.keysMu.Lock()
 	m.active = nil
 	m.keysMu.Unlock()
+}
+
+// handleClose decide se reconecta após o servidor fechar a conexão.
+func (m *MultiEventsClient) handleClose(err error) bool {
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) {
+		return true
+	}
+	switch ce.Code {
+	case CloseTooManyInvalidKeys:
+		m.emitSubscribeError(SubscribeError{Reason: "too_many_invalid_keys"})
+	case CloseNoSubscriptions:
+		m.keysMu.Lock()
+		defer m.keysMu.Unlock()
+		if len(m.keys) == 0 {
+			m.paused = true
+			return false
+		}
+	}
+	return true
+}
+
+func (m *MultiEventsClient) emitSubscribeError(ev SubscribeError) {
+	m.handlersMu.RLock()
+	hs := append([]func(SubscribeError){}, m.onSubscribeError...)
+	m.handlersMu.RUnlock()
+	for _, h := range hs {
+		h(ev)
+	}
 }
 
 func (m *MultiEventsClient) handleControl(raw []byte) bool {

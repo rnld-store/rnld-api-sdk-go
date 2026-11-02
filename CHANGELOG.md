@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0] - 2026-11-02
+Paridade com a v1.8.0 do SDK TypeScript.
+### Added
+- `MultiEventsClient`: tratamento dos close codes do `rnld-bots-websocket` em `/ws/multi`, exportados como `CloseNoSubscriptions` (4001) e `CloseTooManyInvalidKeys` (4002).
+  - 4001 (conexão sem nenhuma guild assinada): sem keys, a reconexão fica suspensa até o próximo `Subscribe`; com keys, reconecta normalmente.
+  - 4002 (excesso de keys inválidas): dispara `OnSubscribeError` com `Reason: "too_many_invalid_keys"` e reconecta com backoff.
+- `SubscribeError.Reason` pode ser `unavailable` (banco do servidor indisponível).
+
 ## [1.1.0] - 2026-11-02
 Paridade com a v1.7.0 do SDK TypeScript.
 ### Added

@@ -243,3 +243,139 @@ func TestMultiResubscribesAfterReconnect(t *testing.T) {
 	want := []controlRequest{{Op: "subscribe", APIKeys: []string{"k2"}}}
 	eventually(t, func() bool { return reflect.DeepEqual(f.snapshot(), want) }, "resubscribe k2 only")
 }
+
+// ── Fechamentos do servidor (contrato com rnld-bots-websocket) ───────────
+
+// reconnectWindow cobre uma reconexão (backoff mínimo 1s com jitter 50–100%).
+const reconnectWindow = 1500 * time.Millisecond
+
+func (f *fakeMultiServer) closeWith(i, code int, reason string) {
+	conn := f.socket(i)
+	f.writeMu.Lock()
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
+	f.writeMu.Unlock()
+	_ = conn.Close()
+}
+
+func (f *fakeMultiServer) socketCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sockets)
+}
+
+func disconnectedSignal(m *MultiEventsClient) <-chan struct{} {
+	ch := make(chan struct{}, 10)
+	m.OnDisconnected(func() { ch <- struct{}{} })
+	return ch
+}
+
+func TestMultiCloseCodesMatchServer(t *testing.T) {
+	if CloseNoSubscriptions != 4001 || CloseTooManyInvalidKeys != 4002 {
+		t.Fatalf("close codes diverged from rnld-bots-websocket: %d %d", CloseNoSubscriptions, CloseTooManyInvalidKeys)
+	}
+}
+
+func TestMultiNoSubscriptionsWithoutKeysPausesUntilSubscribe(t *testing.T) {
+	f := startMultiServer(t)
+	m := NewMultiEventsClient(f.url)
+	t.Cleanup(m.Close)
+	connected := connectedSignal(m)
+	disconnected := disconnectedSignal(m)
+	m.Connect()
+	waitFor(t, connected, "connected")
+
+	f.closeWith(0, CloseNoSubscriptions, "no_subscriptions")
+	waitFor(t, disconnected, "disconnected")
+	time.Sleep(reconnectWindow)
+	if n := f.socketCount(); n != 1 {
+		t.Fatalf("reconnected while paused: %d sockets", n)
+	}
+
+	m.Subscribe("k1")
+	waitFor(t, connected, "reconnected after Subscribe")
+	want := []controlRequest{{Op: "subscribe", APIKeys: []string{"k1"}}}
+	eventually(t, func() bool { return reflect.DeepEqual(f.snapshot(), want) }, "subscribe k1 on new connection")
+	if n := f.socketCount(); n != 2 {
+		t.Fatalf("sockets = %d, want 2", n)
+	}
+}
+
+func TestMultiNoSubscriptionsWithKeysReconnects(t *testing.T) {
+	f := startMultiServer(t)
+	m := NewMultiEventsClient(f.url)
+	t.Cleanup(m.Close)
+	m.Subscribe("bad-1")
+	connected := connectedSignal(m)
+	m.Connect()
+	waitFor(t, connected, "connected")
+	eventually(t, func() bool { return len(f.snapshot()) == 1 }, "initial subscribe")
+	f.reset()
+
+	f.closeWith(0, CloseNoSubscriptions, "no_subscriptions")
+	waitFor(t, connected, "reconnected")
+	want := []controlRequest{{Op: "subscribe", APIKeys: []string{"bad-1"}}}
+	eventually(t, func() bool { return reflect.DeepEqual(f.snapshot(), want) }, "resubscribe")
+}
+
+func TestMultiTooManyInvalidKeysEmitsErrorAndReconnects(t *testing.T) {
+	f := startMultiServer(t)
+	m := NewMultiEventsClient(f.url)
+	t.Cleanup(m.Close)
+	m.Subscribe("k1")
+	errs := make(chan SubscribeError, 1)
+	m.OnSubscribeError(func(e SubscribeError) { errs <- e })
+	connected := connectedSignal(m)
+	m.Connect()
+	waitFor(t, connected, "connected")
+
+	f.closeWith(0, CloseTooManyInvalidKeys, "too_many_invalid_keys")
+	select {
+	case e := <-errs:
+		if e != (SubscribeError{Reason: "too_many_invalid_keys"}) {
+			t.Fatalf("unexpected subscribe error: %+v", e)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for too_many_invalid_keys")
+	}
+	waitFor(t, connected, "reconnected")
+}
+
+func TestMultiSubscribeAfterCloseDoesNotReopenPausedConnection(t *testing.T) {
+	f := startMultiServer(t)
+	m := NewMultiEventsClient(f.url)
+	connected := connectedSignal(m)
+	disconnected := disconnectedSignal(m)
+	m.Connect()
+	waitFor(t, connected, "connected")
+
+	f.closeWith(0, CloseNoSubscriptions, "no_subscriptions")
+	waitFor(t, disconnected, "disconnected")
+	m.Close()
+	m.Subscribe("k1")
+	time.Sleep(reconnectWindow)
+
+	if n := f.socketCount(); n != 1 {
+		t.Fatalf("reconnected after Close: %d sockets", n)
+	}
+}
+
+func TestMultiConnectAfterPauseDoesNotDuplicateLoop(t *testing.T) {
+	f := startMultiServer(t)
+	m := NewMultiEventsClient(f.url)
+	t.Cleanup(m.Close)
+	connected := connectedSignal(m)
+	disconnected := disconnectedSignal(m)
+	m.Connect()
+	waitFor(t, connected, "connected")
+
+	f.closeWith(0, CloseNoSubscriptions, "no_subscriptions")
+	waitFor(t, disconnected, "disconnected")
+	m.Connect()
+	waitFor(t, connected, "reconnected via Connect")
+	m.Subscribe("k1")
+	time.Sleep(reconnectWindow)
+
+	if n := f.socketCount(); n != 2 {
+		t.Fatalf("sockets = %d, want 2 (Subscribe must not start a second loop)", n)
+	}
+}
