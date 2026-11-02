@@ -2,6 +2,7 @@ package rnld
 
 import (
 	"encoding/json"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -24,25 +25,38 @@ type wsEnvelope struct {
 
 // EventsClient conecta via WebSocket ao rnld-bots-websocket e despacha os
 // eventos Redis retransmitidos (ban, tempban, unban, liberation, etc).
-// Reconecta automaticamente com backoff exponencial (1s → 30s) em caso de
-// queda de conexão.
+// Reconecta automaticamente com backoff exponencial (1s → 30s, com jitter
+// de 50–100% do delay) em caso de queda de conexão.
 //
 // Handlers são chamados de forma síncrona na goroutine de leitura do
 // WebSocket — não bloqueie neles; despache trabalho pesado para sua própria
 // goroutine.
 type EventsClient struct {
-	apiKey string
-	wsURL  string
+	wsURL string
+	// header enviado no handshake (nil = sem autenticação por header).
+	header http.Header
+
+	// hooks usados pelo MultiEventsClient.
+	// onOpen é chamado após cada conexão (inclusive reconexões), depois dos
+	// handlers OnConnected.
+	onOpen func(conn *websocket.Conn)
+	// control recebe cada mensagem bruta antes do dispatch normal; retorna
+	// true se a mensagem foi consumida.
+	control func(raw []byte) bool
 
 	connMu         sync.Mutex
 	conn           *websocket.Conn
 	destroyed      bool
 	reconnectDelay time.Duration
 
+	writeMu sync.Mutex
+
 	handlersMu       sync.RWMutex
 	onBan            []func(BanEvent)
 	onTempban        []func(TempBanEvent)
 	onUnban          []func(UnbanEvent)
+	onUnbanBulk      []func(UnbanBulkEvent)
+	onGuildWipe      []func(GuildWipeEvent)
 	onNicknameFailed []func(NicknameFailedEvent)
 	onUpdateNickname []func(UpdateNicknameEvent)
 	onUpdateRoles    []func(UpdateRolesEvent)
@@ -54,92 +68,74 @@ type EventsClient struct {
 }
 
 func newEventsClient(apiKey, wsURL string) *EventsClient {
-	return &EventsClient{apiKey: apiKey, wsURL: wsURL, reconnectDelay: minReconnectDelay}
+	return &EventsClient{
+		wsURL:          wsURL,
+		header:         http.Header{"x-api-key": []string{apiKey}},
+		reconnectDelay: minReconnectDelay,
+	}
 }
 
 // ── Registro de handlers ─────────────────────────────────────────────────
 
-func (e *EventsClient) OnBan(h func(BanEvent)) *EventsClient {
+func addHandler[T any](e *EventsClient, list *[]T, h T) *EventsClient {
 	e.handlersMu.Lock()
-	e.onBan = append(e.onBan, h)
+	*list = append(*list, h)
 	e.handlersMu.Unlock()
 	return e
 }
+
+func (e *EventsClient) OnBan(h func(BanEvent)) *EventsClient { return addHandler(e, &e.onBan, h) }
 
 func (e *EventsClient) OnTempban(h func(TempBanEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onTempban = append(e.onTempban, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onTempban, h)
 }
 
-func (e *EventsClient) OnUnban(h func(UnbanEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onUnban = append(e.onUnban, h)
-	e.handlersMu.Unlock()
-	return e
+func (e *EventsClient) OnUnban(h func(UnbanEvent)) *EventsClient { return addHandler(e, &e.onUnban, h) }
+
+// OnUnbanBulk registra um handler para lotes de desbanimento em massa. Um
+// lote pode chegar em vários chunks (mesmo BatchID, Chunk 1..Chunks).
+func (e *EventsClient) OnUnbanBulk(h func(UnbanBulkEvent)) *EventsClient {
+	return addHandler(e, &e.onUnbanBulk, h)
+}
+
+// OnGuildWipe registra um handler para o wipe de uma guild
+// (POST /mngr/wipeguild).
+func (e *EventsClient) OnGuildWipe(h func(GuildWipeEvent)) *EventsClient {
+	return addHandler(e, &e.onGuildWipe, h)
 }
 
 func (e *EventsClient) OnNicknameFailed(h func(NicknameFailedEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onNicknameFailed = append(e.onNicknameFailed, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onNicknameFailed, h)
 }
 
 func (e *EventsClient) OnUpdateNickname(h func(UpdateNicknameEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onUpdateNickname = append(e.onUpdateNickname, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onUpdateNickname, h)
 }
 
 func (e *EventsClient) OnUpdateRoles(h func(UpdateRolesEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onUpdateRoles = append(e.onUpdateRoles, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onUpdateRoles, h)
 }
 
 func (e *EventsClient) OnLiberation(h func(LiberationEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onLiberation = append(e.onLiberation, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onLiberation, h)
 }
 
 func (e *EventsClient) OnBridgeMessage(h func(BridgeMessageEvent)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onBridgeMessage = append(e.onBridgeMessage, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onBridgeMessage, h)
 }
 
 // OnConnected registra um handler chamado quando a conexão WebSocket é
 // estabelecida (ou reestabelecida após queda).
-func (e *EventsClient) OnConnected(h func()) *EventsClient {
-	e.handlersMu.Lock()
-	e.onConnected = append(e.onConnected, h)
-	e.handlersMu.Unlock()
-	return e
-}
+func (e *EventsClient) OnConnected(h func()) *EventsClient { return addHandler(e, &e.onConnected, h) }
 
 // OnDisconnected registra um handler chamado quando a conexão cai;
 // reconexão automática será tentada.
 func (e *EventsClient) OnDisconnected(h func()) *EventsClient {
-	e.handlersMu.Lock()
-	e.onDisconnected = append(e.onDisconnected, h)
-	e.handlersMu.Unlock()
-	return e
+	return addHandler(e, &e.onDisconnected, h)
 }
 
 // OnError registra um handler chamado para erros de conexão/leitura.
-func (e *EventsClient) OnError(h func(error)) *EventsClient {
-	e.handlersMu.Lock()
-	e.onError = append(e.onError, h)
-	e.handlersMu.Unlock()
-	return e
-}
+func (e *EventsClient) OnError(h func(error)) *EventsClient { return addHandler(e, &e.onError, h) }
 
 // ── Conexão ──────────────────────────────────────────────────────────────
 
@@ -176,7 +172,7 @@ func (e *EventsClient) connectLoop() {
 			return
 		}
 
-		conn, _, err := websocket.DefaultDialer.Dial(e.wsURL, http.Header{"x-api-key": []string{e.apiKey}})
+		conn, _, err := websocket.DefaultDialer.Dial(e.wsURL, e.header)
 		if err != nil {
 			e.emitError(err)
 			e.waitReconnectDelay()
@@ -184,10 +180,18 @@ func (e *EventsClient) connectLoop() {
 		}
 
 		e.connMu.Lock()
+		if e.destroyed {
+			e.connMu.Unlock()
+			_ = conn.Close()
+			return
+		}
 		e.conn = conn
 		e.reconnectDelay = minReconnectDelay
 		e.connMu.Unlock()
 		e.emitConnected()
+		if e.onOpen != nil {
+			e.onOpen(conn)
+		}
 
 		e.readLoop(conn)
 
@@ -214,6 +218,14 @@ func (e *EventsClient) readLoop(conn *websocket.Conn) {
 	}
 }
 
+// writeJSON serializa escritas concorrentes no socket (gorilla/websocket
+// permite apenas um writer por vez).
+func (e *EventsClient) writeJSON(conn *websocket.Conn, v any) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return conn.WriteJSON(v)
+}
+
 func (e *EventsClient) waitReconnectDelay() {
 	e.connMu.Lock()
 	delay := e.reconnectDelay
@@ -224,22 +236,36 @@ func (e *EventsClient) waitReconnectDelay() {
 	e.reconnectDelay = next
 	e.connMu.Unlock()
 
-	time.Sleep(delay)
+	// jitter (50–100% do delay): evita que muitos clientes reconectem em
+	// sincronia quando o servidor reinicia.
+	time.Sleep(jitter(delay))
+}
+
+func jitter(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.5 + rand.Float64()*0.5))
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────
 
+func decodeAndEmit[T any](e *EventsClient, payload json.RawMessage, hs *[]func(T)) {
+	var ev T
+	if json.Unmarshal(payload, &ev) == nil {
+		emitAll(e, hs, ev)
+	}
+}
+
 func (e *EventsClient) dispatch(raw []byte) {
+	if e.control != nil && e.control(raw) {
+		return
+	}
+
 	var envelope wsEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return
 	}
 
 	if envelope.Channel == channelLiberation {
-		var ev LiberationEvent
-		if err := json.Unmarshal(envelope.Payload, &ev); err == nil {
-			e.emitLiberation(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onLiberation)
 		return
 	}
 
@@ -252,111 +278,31 @@ func (e *EventsClient) dispatch(raw []byte) {
 
 	switch typed.Type {
 	case "ban":
-		var ev BanEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitBan(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onBan)
 	case "tempban":
-		var ev TempBanEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitTempban(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onTempban)
 	case "unban":
-		var ev UnbanEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitUnban(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onUnban)
+	case "unban_bulk":
+		decodeAndEmit(e, envelope.Payload, &e.onUnbanBulk)
+	case "guild_wipe":
+		decodeAndEmit(e, envelope.Payload, &e.onGuildWipe)
 	case "nicknameFailed":
-		var ev NicknameFailedEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitNicknameFailed(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onNicknameFailed)
 	case "updateNickname":
-		var ev UpdateNicknameEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitUpdateNickname(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onUpdateNickname)
 	case "updateRoles":
-		var ev UpdateRolesEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitUpdateRoles(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onUpdateRoles)
 	case "bridge_message":
-		var ev BridgeMessageEvent
-		if json.Unmarshal(envelope.Payload, &ev) == nil {
-			e.emitBridgeMessage(ev)
-		}
+		decodeAndEmit(e, envelope.Payload, &e.onBridgeMessage)
 	}
 }
 
 // ── Emit ─────────────────────────────────────────────────────────────────
 
-func (e *EventsClient) emitBan(ev BanEvent) {
+func emitAll[T any](e *EventsClient, list *[]func(T), ev T) {
 	e.handlersMu.RLock()
-	hs := append([]func(BanEvent){}, e.onBan...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitTempban(ev TempBanEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(TempBanEvent){}, e.onTempban...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitUnban(ev UnbanEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(UnbanEvent){}, e.onUnban...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitNicknameFailed(ev NicknameFailedEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(NicknameFailedEvent){}, e.onNicknameFailed...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitUpdateNickname(ev UpdateNicknameEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(UpdateNicknameEvent){}, e.onUpdateNickname...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitUpdateRoles(ev UpdateRolesEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(UpdateRolesEvent){}, e.onUpdateRoles...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitLiberation(ev LiberationEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(LiberationEvent){}, e.onLiberation...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(ev)
-	}
-}
-
-func (e *EventsClient) emitBridgeMessage(ev BridgeMessageEvent) {
-	e.handlersMu.RLock()
-	hs := append([]func(BridgeMessageEvent){}, e.onBridgeMessage...)
+	hs := append([]func(T){}, (*list)...)
 	e.handlersMu.RUnlock()
 	for _, h := range hs {
 		h(ev)
@@ -381,11 +327,4 @@ func (e *EventsClient) emitDisconnected() {
 	}
 }
 
-func (e *EventsClient) emitError(err error) {
-	e.handlersMu.RLock()
-	hs := append([]func(error){}, e.onError...)
-	e.handlersMu.RUnlock()
-	for _, h := range hs {
-		h(err)
-	}
-}
+func (e *EventsClient) emitError(err error) { emitAll(e, &e.onError, err) }

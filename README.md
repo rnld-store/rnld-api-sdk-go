@@ -147,7 +147,7 @@ fmt.Println(result.Data.WlID)    // *string — nil quando não é staff
 
 ## Eventos em tempo real (`Client.Events`)
 
-Conecta via WebSocket ao `rnld-bots-websocket` e despacha os eventos Redis retransmitidos. Reconecta automaticamente com backoff exponencial (1s → 30s).
+Conecta via WebSocket ao `rnld-bots-websocket` e despacha os eventos Redis retransmitidos. Reconecta automaticamente com backoff exponencial (1s → 30s) com jitter (50–100% do delay), evitando reconexões sincronizadas após queda do servidor.
 
 ```go
 client.Events.
@@ -165,11 +165,39 @@ client.Events.Connect()
 defer client.Events.Close()
 ```
 
-Handlers disponíveis: `OnBan`, `OnTempban`, `OnUnban`, `OnNicknameFailed`, `OnUpdateNickname`, `OnUpdateRoles`, `OnLiberation`, `OnBridgeMessage`, `OnConnected`, `OnDisconnected`, `OnError`.
+Handlers disponíveis: `OnBan`, `OnTempban`, `OnUnban`, `OnUnbanBulk`, `OnGuildWipe`, `OnNicknameFailed`, `OnUpdateNickname`, `OnUpdateRoles`, `OnLiberation`, `OnBridgeMessage`, `OnConnected`, `OnDisconnected`, `OnError`.
 
 > **Atenção:** handlers são chamados de forma síncrona na goroutine de leitura do WebSocket — não bloqueie neles; despache trabalho pesado (I/O, chamadas de rede) para sua própria goroutine.
 
 `WSURL` em `ClientOptions` sobrescreve o endpoint (default `wss://events.rnld.dev/ws`); necessário para usar `Client.Events`.
+
+- `OnUnbanBulk` — desbanimento em massa; um lote pode chegar em vários chunks (mesmo `BatchID`, `Chunk` 1..`Chunks`) e substitui os eventos `unban` individuais nesse fluxo.
+- `OnGuildWipe` — wipe de uma guild (`POST /mngr/wipeguild`), com `PlayersRemoved`, `TotalRemoved` e `Deleted` (linhas removidas por tabela).
+
+### Várias guilds em uma conexão (`MultiEventsClient`)
+
+Uma única conexão WebSocket (`/ws/multi`) para várias guilds. A autenticação é por mensagem: cada guild é assinada com a respectiva api_key. Os eventos são os mesmos do `EventsClient` e já trazem `GuildID`. Ao reconectar, todas as keys assinadas são reenviadas automaticamente; pedidos grandes são divididos em lotes de 100 keys.
+
+```go
+multi := rnld.NewMultiEventsClient("") // default wss://events.rnld.dev/ws/multi
+
+multi.
+    OnSubscribed(func(guildID string) { log.Println("assinada", guildID) }).
+    OnSubscribeError(func(e rnld.SubscribeError) {
+        log.Printf("assinatura recusada: %s (%s)", e.Reason, e.APIKeyHint) // invalid_key, limit_exceeded...
+    })
+multi.OnBan(func(ev rnld.BanEvent) {
+    log.Printf("[%s] %s banido", ev.GuildID, ev.DiscordID)
+})
+
+multi.Subscribe("key-guild-a", "key-guild-b") // pode ser chamado antes ou depois do Connect
+multi.Connect()
+defer multi.Close()
+
+multi.Unsubscribe("key-guild-a")
+```
+
+Handlers extras: `OnSubscribed`, `OnUnsubscribed`, `OnSubscribeError`. Requer `rnld-bots-websocket` com o endpoint `/ws/multi`.
 
 ---
 
@@ -231,6 +259,8 @@ Comandos registrados automaticamente na guild:
 | `/wl-remover` | Remove a whitelist de um jogador |
 | `/wl-ban` | Bane um jogador (motivo opcional) |
 | `/wl-desban` | Desbane um jogador |
+
+O exemplo também loga todos os eventos de `Client.Events`, incluindo `unban_bulk` e `guild_wipe`. Com `MULTI_API_KEYS` definido (api_keys separadas por vírgula), ele abre ainda um `MultiEventsClient` que assina todas essas guilds em uma única conexão `/ws/multi`. `MULTI_WS_URL` é opcional e sobrescreve o endpoint.
 
 ## Build e testes
 
